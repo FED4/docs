@@ -789,10 +789,70 @@ torchrun --nproc_per_node=8 ddp_bench.py \
   </Accordion>
 
   <Accordion title="Straggler 怎么找？所有 rank 都卡住了，很难定位">
-  Collective 让所有 rank 等最慢的那个，表面上"全卡了"。排查方法：Per-rank profiling（Nsight Systems 对每个 rank 分别采集
-  timeline，比较同一个 all-reduce 中各 rank 的到达时间）；网卡计数器（`ethtool -S` / InfiniBand
-  `perfquery`，看错误数、丢包、重传）；CPU affinity 检查（`numactl --show` 确认进程绑在正确的 NUMA node）；排除法（每次同一个 rank
-  慢 → 查硬件，随机漂移 → 网络拥塞或 OS 抖动）。
+  Collective 让所有 rank 等最慢的那个，表面上"全卡了"。关键是**量化每个 rank 到达同步点的时间差**，而不是看"谁卡了"。
+
+  **第一步：Per-rank Nsight Systems 采集，找到谁晚到。**
+
+  ```bash
+  # 每个 rank 单独输出一份 timeline（用 %q{RANK} 自动命名）
+  nsys profile -o trace_rank%q{RANK} --trace=cuda,nvtx,osrt \
+    torchrun --nproc_per_node=8 train.py
+  ```
+
+  打开 Nsight Systems GUI，加载所有 rank 的 trace，定位同一个 `ncclAllReduce` kernel：正常 rank 在 T=100ms 进入，straggler 在 T=108ms 进入，那 8ms 就是被这个 rank 的上游计算或数据加载拖慢的。
+
+  **第二步：确认是固定 rank 还是随机漂移。**
+
+  ```bash
+  # 连续跑 50 step，每 step 打印各 rank 到达 barrier 的时间戳
+  # 在训练代码的 all-reduce 前后加：
+  torch.cuda.synchronize()
+  t = time.perf_counter()
+  dist.all_reduce(tensor)
+  torch.cuda.synchronize()
+  elapsed = time.perf_counter() - t
+  # 收集所有 rank 的 elapsed → 最大值 - 最小值 = skew
+  ```
+
+  如果**每次都是同一个 rank 慢** → 硬件问题（坏卡、NVLink 降速、NIC 故障）。如果**随机漂移** → OS 抖动、网络拥塞或 CPU 调度问题。
+
+  **第三步：硬件级排查（固定 rank 慢时）。**
+
+  ```bash
+  # 1. 检查 GPU 时钟是否被降频（散热、ECC 错误）
+  nvidia-smi -q -d CLOCK,ECC | grep -A5 "GPU 000000:XX"
+
+  # 2. 检查 NVLink 状态和错误计数
+  nvidia-smi nvlink -s    # 链路状态
+  nvidia-smi nvlink -e    # 错误计数，非零说明链路有问题
+
+  # 3. 检查网卡丢包和重传（InfiniBand）
+  perfquery -x            # 端口计数器
+  # 或以太网
+  ethtool -S eth0 | grep -i "err\|drop\|retrans"
+
+  # 4. 检查 NUMA 绑定——进程是否跨 NUMA 访问远端内存
+  numactl --show          # 当前 CPU/memory 绑定
+  nvidia-smi topo -m      # GPU 和 NIC 的 NUMA 亲和关系
+  # GPU 和它使用的 NIC 应该在同一个 NUMA node
+  ```
+
+  **第四步：OS/调度级排查（随机漂移时）。**
+
+  ```bash
+  # 1. 检查是否有其他进程抢 CPU
+  top -b -n1 | head -20
+
+  # 2. 检查中断是否集中在某些核上（网卡中断风暴）
+  cat /proc/interrupts | grep mlx  # Mellanox NIC 中断分布
+
+  # 3. 检查 transparent huge pages 和 NUMA balancing 是否干扰
+  cat /sys/kernel/mm/transparent_hugepage/enabled
+  cat /proc/sys/kernel/numa_balancing
+  # 训练场景建议关闭 numa_balancing（echo 0）
+  ```
+
+  **总结判断流程：** Nsight 定位谁慢 → 区分固定/随机 → 固定查硬件（GPU 降频、NVLink 错误、NIC 丢包、NUMA 错配）→ 随机查 OS（CPU 争抢、中断风暴、内核参数）。
   </Accordion>
 
   <Accordion title="NCCL_MAX_NCHANNELS 怎么调？">
